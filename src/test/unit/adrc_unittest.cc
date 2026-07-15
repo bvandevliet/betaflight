@@ -734,3 +734,143 @@ TEST_F(AdrcUnittest, NonFiniteRuntimeStateRecoversToFiniteOutput)
     EXPECT_TRUE(isfinite(invalidInputOut.I));
     EXPECT_TRUE(isfinite(invalidInputOut.D));
 }
+
+// --- Cascade (2nd-stage) ESO: docs/pid-adrc-converter/eso_cascade_sim.py's "anchored-z1" mode,
+// see adrc.h cascadeAlphaX10 and adrcApplyControl()'s cascade block for the design.
+// cascadeAlphaX10 == 0 (the default) is covered by every test above unchanged - none of them
+// touch it, so they also serve as the disabled-path regression coverage.
+
+TEST_F(AdrcUnittest, CascadeDisabledByDefaultIsExactNoOp)
+{
+    // profile.cascadeAlphaX10 defaults to 0 from adrcResetProfile() - confirm the coefficient
+    // comes out 0 too (not floored the way wo is), so the cascade block in adrcApplyControl()
+    // never executes.
+    EXPECT_FLOAT_EQ(0.0f, runtime.coefficient[FD_ROLL].wo2);
+    EXPECT_FLOAT_EQ(0.0f, runtime.coefficient[FD_ROLL].beta1_2);
+    EXPECT_FLOAT_EQ(0.0f, runtime.coefficient[FD_ROLL].beta2_2);
+    EXPECT_FLOAT_EQ(0.0f, runtime.coefficient[FD_ROLL].beta3_2);
+}
+
+TEST_F(AdrcUnittest, CascadeAlphaDerivesWo2FromCurrentWo)
+{
+    // wo2 = wo * (cascadeAlphaX10/10), NOT a directly stored absolute value - confirm retuning wo
+    // carries the 2nd stage along with it, per the adrc.h cascadeAlphaX10 rationale. Deliberately
+    // NOT the fixture's TEST_DT (125 Hz-equivalent, ADRC_ESO_MAX_WO_DT/dT = 62.5): both target
+    // values here (300, 500) would be discretization-clamped there, testing the clamp instead of
+    // the alpha derivation this test exists to check. A fast dT keeps the cap (4000) well clear.
+    constexpr float dT = 0.000125f; // 8 kHz
+    profile.wo[FD_ROLL] = 60;
+    profile.cascadeAlphaX10[FD_ROLL] = 50; // alpha = 5.0
+    adrcInitConfig(&profile, &runtime, dT);
+    EXPECT_FLOAT_EQ(300.0f, runtime.coefficient[FD_ROLL].wo2); // 60 * 5.0
+
+    profile.wo[FD_ROLL] = 100;
+    adrcInitConfig(&profile, &runtime, dT);
+    EXPECT_FLOAT_EQ(500.0f, runtime.coefficient[FD_ROLL].wo2); // 100 * 5.0 - moved with wo
+}
+
+TEST_F(AdrcUnittest, CascadeEsoSweepConvergesAtSupportedLoopRates)
+{
+    // Same shape as EsoSweepConvergesAtSupportedLoopRates above, but with the cascade stage
+    // enabled across an alpha sweep - this is the numerical-stability check that actually matters
+    // before flying it: a divergent 2nd stage would still be masked by the outer NaN/Inf recovery,
+    // but only after already corrupting a control step. alpha up to 15.0 with wo=60 pushes wo2 up
+    // to 900, above ADRC_WO_MAX (600) - exercises that clamp too, not just the sim-explored range.
+    const int loopRatesHz[] = { 200, 1600, 3205, 8000 };
+    const int alphaX10Values[] = { 10, 20, 40, 60, 80, 100, 150 }; // alpha 1.0 .. 15.0
+
+    profile.gyroFilterHz = 0;
+    profile.wo[FD_ROLL] = 60;
+    for (const int loopRateHz : loopRatesHz) {
+        const float dT = 1.0f / loopRateHz;
+        for (const int alphaX10 : alphaX10Values) {
+            SCOPED_TRACE(::testing::Message() << "loopRateHz=" << loopRateHz << ", alphaX10=" << alphaX10);
+            profile.cascadeAlphaX10[FD_ROLL] = alphaX10;
+            adrcInitConfig(&profile, &runtime, dT);
+            gyro.gyroADCf[FD_ROLL] = 0.0f;
+            adrcResetState(&runtime, FD_ROLL);
+            runtime.liftoff = true;
+
+            for (int i = 0; i < loopRateHz / 2; i++) {
+                const adrcOutput_t out = adrcApplyControl(&runtime, FD_ROLL, 1000.0f, 1000.0f, dT, 500.0f);
+                ASSERT_TRUE(isfinite(runtime.z1_2[FD_ROLL]));
+                ASSERT_TRUE(isfinite(runtime.z2_2[FD_ROLL]));
+                ASSERT_TRUE(isfinite(runtime.z3_2[FD_ROLL]));
+                ASSERT_TRUE(isfinite(out.P));
+                ASSERT_TRUE(isfinite(out.I));
+                ASSERT_TRUE(isfinite(out.D));
+            }
+            EXPECT_NEAR(1000.0f, runtime.z1[FD_ROLL], 500.0f);
+        }
+    }
+}
+
+TEST_F(AdrcUnittest, CascadeCombinedITermRespectsPidSumLimit)
+{
+    // z3Final = z3[axis] + z3_2[axis] must stay bounded by pidSumLimit*b0 even though each term is
+    // independently clamped to that same bound - the combined clamp in adrcApplyControl() is what
+    // actually prevents |I| = |z3Final/b0| from reaching 2x pidSumLimit if both saturate together.
+    constexpr float dT = 0.000125f; // 8 kHz
+    constexpr float pidSumLimit = 500.0f;
+    profile.wo[FD_ROLL] = 60;
+    profile.cascadeAlphaX10[FD_ROLL] = 50; // alpha 5.0 -> wo2 = 300
+    profile.b0[FD_ROLL] = 2000;
+    adrcInitConfig(&profile, &runtime, dT);
+    adrcResetState(&runtime, FD_ROLL);
+    runtime.liftoff = true;
+
+    // Force both stages toward saturation with a large, persistent measurement error.
+    for (int i = 0; i < 2000; i++) {
+        const adrcOutput_t out = adrcApplyControl(&runtime, FD_ROLL, 4000.0f, 0.0f, dT, pidSumLimit);
+        ASSERT_TRUE(isfinite(out.I));
+        EXPECT_LE(fabsf(out.I), pidSumLimit + 1.0f); // +1 for float slop
+    }
+}
+
+TEST_F(AdrcUnittest, ClearDisturbanceEstimateZeroesBothCascadeStages)
+{
+    profile.cascadeAlphaX10[FD_ROLL] = 30; // alpha 3.0, default wo=100 -> wo2 = 300
+    adrcInitConfig(&profile, &runtime, TEST_DT);
+    adrcResetState(&runtime, FD_ROLL);
+
+    runtime.z3[FD_ROLL] = 1234.0f;
+    runtime.z3_2[FD_ROLL] = 5678.0f;
+    adrcClearDisturbanceEstimate(&runtime, FD_ROLL);
+    EXPECT_FLOAT_EQ(0.0f, runtime.z3[FD_ROLL]);
+    EXPECT_FLOAT_EQ(0.0f, runtime.z3_2[FD_ROLL]);
+}
+
+TEST_F(AdrcUnittest, RecoveryClearsBothCascadeStages)
+{
+    profile.cascadeAlphaX10[FD_ROLL] = 30; // alpha 3.0, default wo=100 -> wo2 = 300
+    adrcInitConfig(&profile, &runtime, TEST_DT);
+    adrcResetState(&runtime, FD_ROLL);
+    runtime.liftoff = true;
+
+    runtime.z3[FD_ROLL] = 1234.0f;
+    runtime.z3_2[FD_ROLL] = 5678.0f;
+    const adrcOutput_t out = adrcApplyControlWithRecovery(&runtime, FD_ROLL, 0.0f, 0.0f, TEST_DT, 500.0f,
+        /* yawSpinRecoveryActive */ true, /* crashRecoveryActive */ false);
+    EXPECT_FLOAT_EQ(0.0f, runtime.z3[FD_ROLL]);
+    EXPECT_FLOAT_EQ(0.0f, runtime.z3_2[FD_ROLL]);
+    EXPECT_FLOAT_EQ(0.0f, out.I);
+}
+
+TEST_F(AdrcUnittest, CascadeNonFiniteStateRecoversToFiniteOutput)
+{
+    profile.cascadeAlphaX10[FD_ROLL] = 30; // alpha 3.0, default wo=100 -> wo2 = 300
+    adrcInitConfig(&profile, &runtime, TEST_DT);
+    adrcResetState(&runtime, FD_ROLL);
+
+    runtime.z1_2[FD_ROLL] = NAN;
+    runtime.z2_2[FD_ROLL] = INFINITY;
+    runtime.z3_2[FD_ROLL] = -INFINITY;
+
+    const adrcOutput_t out = adrcApplyControl(&runtime, FD_ROLL, 100.0f, 200.0f, TEST_DT, 500.0f);
+    EXPECT_TRUE(isfinite(runtime.z1_2[FD_ROLL]));
+    EXPECT_TRUE(isfinite(runtime.z2_2[FD_ROLL]));
+    EXPECT_TRUE(isfinite(runtime.z3_2[FD_ROLL]));
+    EXPECT_TRUE(isfinite(out.P));
+    EXPECT_TRUE(isfinite(out.I));
+    EXPECT_TRUE(isfinite(out.D));
+}

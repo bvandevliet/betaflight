@@ -1420,6 +1420,13 @@ const clivalue_t valueTable[] = {
     { PARAM_NAME_ADRC_WO_ROLL,  VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 10, 600 }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.wo[FD_ROLL]) },
     { PARAM_NAME_ADRC_WO_PITCH, VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 10, 600 }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.wo[FD_PITCH]) },
     { PARAM_NAME_ADRC_WO_YAW,   VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 10, 600 }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.wo[FD_YAW]) },
+    // Scaled x10 (e.g. 60 = alpha 6.0); 0 = cascade disabled. 250 (alpha 25.0) ceiling is a
+    // generous margin above the ~20 upper end explored in eso_cascade_sim.py's sweeps - not itself
+    // validated, just not arbitrarily unbounded. wo2 = wo*alpha is still separately clamped to
+    // [ADRC_WO_MIN, ADRC_WO_MAX] in adrcInitConfig() regardless of what alpha allows here.
+    { PARAM_NAME_ADRC_CASCADE_ALPHA_ROLL,  VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 250 }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.cascadeAlphaX10[FD_ROLL]) },
+    { PARAM_NAME_ADRC_CASCADE_ALPHA_PITCH, VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 250 }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.cascadeAlphaX10[FD_PITCH]) },
+    { PARAM_NAME_ADRC_CASCADE_ALPHA_YAW,   VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 250 }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.cascadeAlphaX10[FD_YAW]) },
     { PARAM_NAME_ADRC_B0_ROLL,  VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 100, UINT16_MAX }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.b0[FD_ROLL]) },
     { PARAM_NAME_ADRC_B0_PITCH, VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 100, UINT16_MAX }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.b0[FD_PITCH]) },
     { PARAM_NAME_ADRC_B0_YAW,   VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 100, UINT16_MAX }, PG_PID_PROFILE, offsetof(pidProfile_t, adrc.b0[FD_YAW]) },

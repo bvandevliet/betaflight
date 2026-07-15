@@ -130,6 +130,13 @@ static void adrcResetAxisState(adrcRuntime_t *adrcRuntime, int axis, float gyroR
     adrcRuntime->z1[axis] = finiteGyroRate;
     adrcRuntime->z2[axis] = 0.0f;
     adrcRuntime->z3[axis] = 0.0f;
+    // 2nd-stage cascade ESO (see adrc.h cascadeAlphaX10 comment): seeded the same way as z1/z2/z3
+    // above, even when disabled (c->wo2 == 0) - harmless while disabled, and avoids a stale-state
+    // kick on the loop
+    // this feature gets enabled mid-session via CLI adjustment range tuning.
+    adrcRuntime->z1_2[axis] = finiteGyroRate;
+    adrcRuntime->z2_2[axis] = 0.0f;
+    adrcRuntime->z3_2[axis] = 0.0f;
     adrcRuntime->vRef[axis] = finiteGyroRate;
     adrcRuntime->lastOutput[axis] = 0.0f;
 }
@@ -141,7 +148,10 @@ static bool adrcAxisStateIsFinite(const adrcRuntime_t *adrcRuntime, int axis)
     return adrcIsFinite(gyroFilter->k) && gyroFilter->k >= 0.0f && gyroFilter->k <= 1.0f
         && adrcIsFinite(gyroFilter->state) && adrcIsFinite(gyroFilter->state1)
         && adrcIsFinite(adrcRuntime->z1[axis]) && adrcIsFinite(adrcRuntime->z2[axis])
-        && adrcIsFinite(adrcRuntime->z3[axis]) && adrcIsFinite(adrcRuntime->vRef[axis])
+        && adrcIsFinite(adrcRuntime->z3[axis])
+        && adrcIsFinite(adrcRuntime->z1_2[axis]) && adrcIsFinite(adrcRuntime->z2_2[axis])
+        && adrcIsFinite(adrcRuntime->z3_2[axis])
+        && adrcIsFinite(adrcRuntime->vRef[axis])
         && adrcIsFinite(adrcRuntime->lastOutput[axis]);
 }
 
@@ -168,6 +178,10 @@ void adrcResetProfile(adrcProfile_t *adrcProfile)
     for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
         adrcProfile->wc[axis] = 60;
         adrcProfile->wo[axis] = (axis == FD_YAW) ? 80 : 100;
+        // Cascade ESO (cascadeAlphaX10, see adrc.h) defaults OFF on every axis: opt-in
+        // flight-test candidate, not a community-validated default like wc/wo/b0 above.
+        // Enable per-axis via CLI (e.g. adrc_cascade_alpha_roll = 60 for alpha = 6.0).
+        adrcProfile->cascadeAlphaX10[axis] = 0;
         adrcProfile->b0[axis] = 2000;
     }
     // Classic PID applies a dedicated, separate filter stage (dterm_lpf1/lpf2) specifically to
@@ -244,12 +258,27 @@ void adrcInitConfig(const adrcProfile_t *adrcProfile, adrcRuntime_t *adrcRuntime
         if (validDt) {
             c->wo = fminf(c->wo, ADRC_ESO_MAX_WO_DT / dT);
         }
+        // cascadeAlphaX10 == 0 means "cascade disabled" (see adrc.h) - c->wo2 must stay exactly
+        // 0.0f in that case, NOT floored up to ADRC_WO_MIN the way wo is above: unlike wo, the
+        // observer isn't required to have a 2nd stage at all. When enabled, wo2 = wo * alpha is
+        // derived from the ALREADY dT-capped c->wo above, so retuning wo (or a slow loop rate
+        // capping it) carries the 2nd stage's bandwidth along with it automatically instead of
+        // leaving it pinned to a stale absolute value.
+        c->wo2 = (adrcProfile->cascadeAlphaX10[axis] > 0)
+            ? constrainf(c->wo * (adrcProfile->cascadeAlphaX10[axis] * 0.1f), ADRC_WO_MIN, ADRC_WO_MAX)
+            : 0.0f;
+        if (validDt && c->wo2 > 0.0f) {
+            c->wo2 = fminf(c->wo2, ADRC_ESO_MAX_WO_DT / dT);
+        }
         c->b0 = fmaxf(adrcProfile->b0[axis], ADRC_B0_MIN);
         c->kp = c->wc * c->wc;
         c->kd = 2.0f * c->wc;
         c->beta1 = 3.0f * c->wo;
         c->beta2 = 3.0f * c->wo * c->wo;
         c->beta3 = c->wo * c->wo * c->wo;
+        c->beta1_2 = 3.0f * c->wo2;
+        c->beta2_2 = 3.0f * c->wo2 * c->wo2;
+        c->beta3_2 = c->wo2 * c->wo2 * c->wo2;
         c->decayRate = fminf(adrcProfile->sigmaDecay, ADRC_SIGMA_DECAY_MAX) * 0.1f;
         const float tdHz = fminf(adrcProfile->tdHz, LPF_MAX_HZ);
         c->tdFilterGain = (tdHz > 0.0f && validDt) ? pt1FilterGain(tdHz, dT) : 0.0f;
@@ -348,6 +377,9 @@ void adrcSetAppliedOutput(adrcRuntime_t *adrcRuntime, int axis, float output)
 void adrcClearDisturbanceEstimate(adrcRuntime_t *adrcRuntime, int axis)
 {
     adrcRuntime->z3[axis] = 0.0f;
+    // The effective disturbance/I-term estimate is z3[axis] + z3_2[axis] once cascade is enabled
+    // (see adrcApplyControl()) - clearing z3[axis] alone would leave a stale residual behind.
+    adrcRuntime->z3_2[axis] = 0.0f;
 }
 
 void adrcUpdatePerLoopState(adrcRuntime_t *adrcRuntime, const adrcProfile_t *adrcProfile, float dT)
@@ -478,6 +510,49 @@ adrcOutput_t adrcApplyControl(adrcRuntime_t *adrcRuntime, int axis, float gyroRa
     const float maxZ3 = finitePidSumLimit * b0;
     adrcRuntime->z3[axis] = constrainf(adrcRuntime->z3[axis], -maxZ3, maxZ3);
 
+    // Optional 2nd-stage (cascade) ESO (see adrc.h cascadeAlphaX10 comment). Its "measurement" is the 1st
+    // stage's own z1 - not the raw noisy gyro - so it can run at a higher bandwidth than wo alone
+    // would allow without re-amplifying sensor noise into the D/I-equivalent terms the way simply
+    // raising wo does (Lakomy & Madonski, arXiv:2004.01483). Disabled (c->wo2 == 0, all beta_2
+    // gains 0) is a pure no-op: z2Final/z3Final below fall straight back to z2[axis]/z3[axis],
+    // reproducing single-stage behavior exactly - no cascade-related change in behavior unless
+    // wo2 is explicitly set on this axis.
+    float z2Final = adrcRuntime->z2[axis];
+    float z3Final = adrcRuntime->z3[axis];
+    if (c->wo2 > 0.0f) {
+        // Deliberately NOT the ported source's own z1 (this project's anchoring choice, not
+        // Lakomy & Madonski's eq. 16): the control law's P-term error below still reads
+        // z1[axis], the 1st stage's estimate, so the pilot's rate-tracking response stays on the
+        // lower, noise-robust bandwidth regardless of wo2. Only the D/I-equivalent terms (z2/z3,
+        // both far more sensitive to wo than P is via kp=wc^2 vs the ESO's beta_i(wo) scaling)
+        // get the faster 2nd stage. Simulated favorably against this scheme specifically
+        // (docs/pid-adrc-converter/eso_cascade_sim.py's "anchored-z1" mode) vs. the paper's own
+        // full-handoff combination, which this project's own simulation found marginally noisier
+        // for no tracking benefit.
+        const float errorEso2 = adrcRuntime->z1_2[axis] - adrcRuntime->z1[axis];
+        // b0u + z3[axis]: the 2nd stage is handed the SAME control input the 1st stage saw, plus
+        // the disturbance the 1st stage already attributed to z3[axis] - so z3_2 converges to the
+        // RESIDUAL disturbance left over after z3[axis], not a duplicate of it (paper's Remark 7).
+        adrcRuntime->z1_2[axis] += finiteDt * (adrcRuntime->z2_2[axis] - c->beta1_2 * errorEso2);
+        adrcRuntime->z2_2[axis] += finiteDt * (adrcRuntime->z3_2[axis] + b0u + adrcRuntime->z3[axis] - c->beta2_2 * errorEso2);
+        adrcRuntime->z3_2[axis] += finiteDt * (-c->beta3_2 * errorEso2 - z3DecayRate * adrcRuntime->z3_2[axis]);
+
+        if (!adrcIsFinite(adrcRuntime->z1_2[axis]) || !adrcIsFinite(adrcRuntime->z2_2[axis])
+            || !adrcIsFinite(adrcRuntime->z3_2[axis])) {
+            adrcResetAxisState(adrcRuntime, axis, finiteGyroRate);
+        }
+
+        // Same physical/authority-derived bounds as the 1st stage above, applied to the 2nd
+        // stage's own states, plus a bound on the COMBINED I-term so |I| = |z3Final/b0| still
+        // cannot exceed pidSumLimit regardless of how the two stages' estimates add up.
+        adrcRuntime->z1_2[axis] = constrainf(adrcRuntime->z1_2[axis], -ADRC_Z1_LIMIT, ADRC_Z1_LIMIT);
+        adrcRuntime->z2_2[axis] = constrainf(adrcRuntime->z2_2[axis], -ADRC_Z2_LIMIT, ADRC_Z2_LIMIT);
+        adrcRuntime->z3_2[axis] = constrainf(adrcRuntime->z3_2[axis], -maxZ3, maxZ3);
+
+        z2Final = adrcRuntime->z2_2[axis];
+        z3Final = constrainf(adrcRuntime->z3[axis] + adrcRuntime->z3_2[axis], -maxZ3, maxZ3);
+    }
+
     // Tracking differentiator (opt-in, off by default): smooths the setpoint driving the control
     // law's P term, separate from the ESO's own error term above (errorEso still tracks the raw
     // gyro directly - the TD only changes what the control law treats as "where we're steering
@@ -500,8 +575,8 @@ adrcOutput_t adrcApplyControl(adrcRuntime_t *adrcRuntime, int axis, float gyroRa
     // were flown in without them.
     adrcOutput_t output = {
         .P = (c->kp * (adrcRuntime->vRef[axis] - adrcRuntime->z1[axis])) / b0,
-        .D = (-c->kd * adrcRuntime->z2[axis]) / b0,
-        .I = (-adrcRuntime->z3[axis]) / b0,
+        .D = (-c->kd * z2Final) / b0,
+        .I = (-z3Final) / b0,
     };
     if (!adrcIsFinite(output.P) || !adrcIsFinite(output.I) || !adrcIsFinite(output.D)) {
         adrcResetAxisState(adrcRuntime, axis, finiteGyroRate);
@@ -510,6 +585,12 @@ adrcOutput_t adrcApplyControl(adrcRuntime_t *adrcRuntime, int axis, float gyroRa
         output.D = 0.0f;
     }
 
+    // KNOWN GAP: debug[] below logs the 1st stage's raw z1/z2/z3, not z2Final/z3Final - the 8-slot
+    // DEBUG_ADRC array is already fully used and cascade's z1_2/z2_2/z3_2 have no slot of their
+    // own. When wo2 > 0 on the axis being flown, the D/I values a blackbox viewer shows here will
+    // NOT match adrcOutput_t.D/.I actually applied to the plant. Flight-test with this in mind
+    // until a follow-up gives the 2nd stage its own logging.
+    //
     // Log all three axes simultaneously (the ported source gates on gyro.gyroDebugAxis, one axis
     // only): roll z1/z2/z3 in [0..2], pitch z1/z2/z3 in [3..5], yaw z3 in [6], throttle-scaled b0
     // multiplier x100 sign-tagged by the liftoff latch (positive = airborne, negative = gated) in
@@ -537,9 +618,11 @@ adrcOutput_t adrcApplyControlWithRecovery(adrcRuntime_t *adrcRuntime, int axis, 
 {
     // Remove a pre-recovery disturbance estimate before the ESO step so stale z3 cannot enter z2
     // once. lastOutput is kept: it is the real command applied during recovery and remains valid
-    // b0*u feedback for the observer's acceleration state.
+    // b0*u feedback for the observer's acceleration state. z3_2 cleared alongside z3 for the same
+    // reason adrcClearDisturbanceEstimate() clears both - see its comment.
     if (yawSpinRecoveryActive || crashRecoveryActive) {
         adrcRuntime->z3[axis] = 0.0f;
+        adrcRuntime->z3_2[axis] = 0.0f;
     }
 
     adrcOutput_t output = adrcApplyControl(adrcRuntime, axis, gyroRate, currentPidSetpoint, dT, pidSumLimit);
@@ -549,6 +632,7 @@ adrcOutput_t adrcApplyControlWithRecovery(adrcRuntime_t *adrcRuntime, int axis, 
         // Suppress it through the first exit loop, then resume from a clean zero state. (Crash
         // recovery handles its own I/z3 post-pass across all axes at once - see pidController().)
         adrcRuntime->z3[axis] = 0.0f;
+        adrcRuntime->z3_2[axis] = 0.0f;
         output.I = 0.0f;
     }
 

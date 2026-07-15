@@ -50,6 +50,29 @@ typedef enum {
 typedef struct adrcProfile_s {
     uint16_t wc[XYZ_AXIS_COUNT]; // controller (virtual PD) bandwidth [rad/s] per axis
     uint16_t wo[XYZ_AXIS_COUNT]; // extended state observer bandwidth [rad/s] per axis
+    uint16_t cascadeAlphaX10[XYZ_AXIS_COUNT]; // OPTIONAL cascade ESO bandwidth ratio, x10, per
+                                   // axis; 0 = disabled (single-stage ESO, matching wo alone), the
+                                   // same "0 = off" convention as tdHz below. Stores a RATIO, not an
+                                   // absolute bandwidth: the 2nd-stage observer bandwidth is derived
+                                   // at init time as wo2 = wo * (cascadeAlphaX10/10) - see
+                                   // adrcInitConfig() - so retuning wo carries the 2nd stage along
+                                   // with it automatically instead of leaving a stale absolute wo2
+                                   // behind (matches Gao (2003)/the cascade paper's own wo2=alpha*wo1
+                                   // parameterization, and how eso_cascade_sim.py's --alpha works).
+                                   // e.g. 60 = alpha 6.0. When enabled, a second ESO tracks the first
+                                   // stage's own z1 estimate (not the noisy raw gyro) at this higher
+                                   // bandwidth, so the D/I-equivalent terms (z2/z3) can track
+                                   // disturbances faster without re-amplifying sensor noise the way
+                                   // simply raising wo alone would. Ported from Lakomy & Madonski,
+                                   // "Cascade Extended State Observer for ADRC Applications under
+                                   // Measurement Noise" (arXiv:2004.01483, ISA Transactions 2020),
+                                   // eq. 4-16 for a p=2 cascade, adapted to this project's own
+                                   // (P-term stays anchored to the first stage's z1; see
+                                   // adrcApplyControl()) rather than their eq. 16 combination -
+                                   // simulated favorably (docs/pid-adrc-converter/eso_cascade_sim.py)
+                                   // against real blackbox gyro noise on this airframe, but UNVALIDATED
+                                   // on real hardware as of this default (2026-07-15) - flight-test
+                                   // candidate, not a community-validated default like wc/wo/b0 above.
     uint16_t b0[XYZ_AXIS_COUNT]; // control-input gain estimate [deg/s^3 per PID output] per axis
     uint16_t gyroFilterHz;       // low-pass cutoff applied to the ESO's gyro input (not per-axis,
                                  // matching dterm_lpf1/lpf2's single-value convention)
@@ -94,12 +117,17 @@ typedef struct adrcProfile_s {
 typedef struct adrcCoefficient_s {
     float wc;      // controller (virtual PD) bandwidth [rad/s]
     float wo;      // effective observer bandwidth [rad/s], capped against the runtime looptime
+    float wo2;     // effective 2nd-stage observer bandwidth [rad/s], capped against the runtime
+                    // looptime; 0 = cascade disabled (see adrcProfile_t.wo2)
     float b0;      // control-input gain estimate [deg/s^3 per PID output]
     float kp;      // = wc*wc (virtual PD control law proportional gain)
     float kd;      // = 2*wc (virtual PD control law derivative gain)
     float beta1;   // = 3*wo (ESO observer gain)
     float beta2;   // = 3*wo*wo (ESO observer gain)
     float beta3;   // = wo*wo*wo (ESO observer gain)
+    float beta1_2; // = 3*wo2 (2nd-stage ESO observer gain); 0 when cascade disabled
+    float beta2_2; // = 3*wo2*wo2 (2nd-stage ESO observer gain); 0 when cascade disabled
+    float beta3_2; // = wo2*wo2*wo2 (2nd-stage ESO observer gain); 0 when cascade disabled
     float decayRate; // = adrcProfile->sigmaDecay * 0.1 (z3 leaky-decay rate, shared across axes)
     float tdFilterGain; // stable PT1 gain for tdHz at the runtime looptime; 0 = TD disabled
     float gatedDecayRate; // = adrcProfile->gatedZ3DecayRate * 0.1 (z3 decay rate while ungated,
@@ -114,6 +142,14 @@ typedef struct adrcRuntime_s {
     float z1[XYZ_AXIS_COUNT]; // ESO estimate of angular rate [deg/s]
     float z2[XYZ_AXIS_COUNT]; // ESO estimate of angular acceleration [deg/s^2]
     float z3[XYZ_AXIS_COUNT]; // ESO estimate of lumped rate-plant disturbance [deg/s^3]
+    float z1_2[XYZ_AXIS_COUNT]; // 2nd-stage ESO's own estimate of z1[axis] (its "measurement" is
+                                 // z1[axis], not the raw gyro - see adrcApplyControl()); unused
+                                 // (stays seeded at the last reset's gyro rate) when wo2 == 0
+    float z2_2[XYZ_AXIS_COUNT]; // 2nd-stage ESO estimate of angular acceleration [deg/s^2] -
+                                 // replaces z2[axis] as the D-term source when cascade is enabled
+    float z3_2[XYZ_AXIS_COUNT]; // 2nd-stage ESO estimate of the disturbance RESIDUE left over from
+                                 // z3[axis] (Lakomy & Madonski's Remark 7); the I-term source when
+                                 // cascade is enabled is z3[axis] + z3_2[axis], not z3_2 alone
     float vRef[XYZ_AXIS_COUNT]; // tracking-differentiator-filtered setpoint fed to the control law;
                                  // tracks the raw setpoint directly when tdFilterGain == 0 (disabled)
     float lastOutput[XYZ_AXIS_COUNT]; // control output fed back into the observer next iteration

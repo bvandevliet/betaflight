@@ -1614,6 +1614,10 @@ static bool blackboxWriteSysinfo(void)
         BLACKBOX_PRINT_HEADER_LINE("adrcWO", "%d,%d,%d",                    currentPidProfile->adrc.wo[FD_ROLL],
                                                                             currentPidProfile->adrc.wo[FD_PITCH],
                                                                             currentPidProfile->adrc.wo[FD_YAW]);
+        // x10 scaled (e.g. 60 = alpha 6.0), 0 = cascade disabled - see adrc.h cascadeAlphaX10.
+        BLACKBOX_PRINT_HEADER_LINE("adrcCascadeAlphaX10", "%d,%d,%d",       currentPidProfile->adrc.cascadeAlphaX10[FD_ROLL],
+                                                                            currentPidProfile->adrc.cascadeAlphaX10[FD_PITCH],
+                                                                            currentPidProfile->adrc.cascadeAlphaX10[FD_YAW]);
         BLACKBOX_PRINT_HEADER_LINE("adrcB0", "%d,%d,%d",                    currentPidProfile->adrc.b0[FD_ROLL],
                                                                             currentPidProfile->adrc.b0[FD_PITCH],
                                                                             currentPidProfile->adrc.b0[FD_YAW]);

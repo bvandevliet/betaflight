@@ -130,7 +130,23 @@ PG_RESET_TEMPLATE(pidConfig_t, pidConfig,
 // existed for). This changes adrcProfile_t's layout - gatedZ3DecayRate/b0ThrottleScaleMax shift to
 // earlier offsets - so, per the ADRC-006 precedent, force the reset rather than let a version-match
 // memcpy reinterpret an old blob's trailing bytes at the wrong fields.
-PG_REGISTER_ARRAY_WITH_RESET_FN(pidProfile_t, PID_PROFILE_COUNT, pidProfiles, PG_PID_PROFILE, 15);
+// 16(wrapped to 0): adrcProfile_t gains wo2[XYZ_AXIS_COUNT] (optional cascade ESO 2nd-stage
+// bandwidth, inserted right after wo[]) - every field from b0[] onward shifts to a later offset.
+// Per the ADRC-006/015 precedent, force the reset rather than let a version-match memcpy
+// reinterpret old bytes: without this bump, a stored b0 value would land in the new wo2 field on
+// load, silently enabling an unvalidated, untuned cascade stage (wo2 != 0) on craft that never
+// asked for it. wo2 defaults to 0 (disabled) in adrcResetProfile(), so a forced reset reproduces
+// prior single-stage behavior exactly on every other field.
+//
+// CANNOT actually be "16": .pgn packs the version into only 4 bits (_version << 12 into a
+// uint16_t, see PG_REGISTER_ARRAY_I in pg.h and PGR_PGN_MASK/pgVersion() in pg.h) - the valid
+// range is 0-15, and this PG was already AT the ceiling (15) before this change. -Werror=overflow
+// in a real target build (STM32F7X2, ARM GCC) caught this; it silently passed the host-only
+// unit-test build, which doesn't compile pg.h's packing macro at all. pgLoad() only checks
+// version == pgVersion(reg) for equality, not ordering (src/main/pg/pg.c), so wrapping to any
+// value other than the immediately-preceding 15 forces the same safe reset - 0 is chosen as the
+// clearest "wrapped" signal, not because 0 has any special meaning to pgLoad() (it doesn't).
+PG_REGISTER_ARRAY_WITH_RESET_FN(pidProfile_t, PID_PROFILE_COUNT, pidProfiles, PG_PID_PROFILE, 0);
 
 void resetPidProfile(pidProfile_t *pidProfile)
 {
