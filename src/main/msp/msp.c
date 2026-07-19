@@ -2111,6 +2111,12 @@ case MSP_NAME:
         sbufWriteU8(dst, currentPidProfile->tpa_mode);
         sbufWriteU8(dst, currentPidProfile->tpa_rate);
         sbufWriteU16(dst, currentPidProfile->tpa_breakpoint);   // was currentControlRateProfile->tpa_breakpoint
+        // Added in MSP API 1.49
+#if defined(USE_ADRC)
+        sbufWriteU8(dst, currentPidProfile->pid_type);
+#else
+        sbufWriteU8(dst, PID_TYPE_CLASSIC);
+#endif
         break;
 
     case MSP_SENSOR_CONFIG:
@@ -3524,6 +3530,20 @@ static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t cmdMSP, 
             currentPidProfile->tpa_mode = sbufReadU8(src);
             currentPidProfile->tpa_rate = MIN(sbufReadU8(src), TPA_MAX);
             currentPidProfile->tpa_breakpoint = sbufReadU16(src);
+        }
+        if (sbufBytesRemaining(src) >= 1) {
+            // Added in MSP API 1.49
+            const uint8_t requestedPidType = sbufReadU8(src);
+#if defined(USE_ADRC)
+            if (requestedPidType > PID_TYPE_ADRC) {
+                return MSP_RESULT_ERROR;
+            }
+            currentPidProfile->pid_type = requestedPidType;
+#else
+            if (requestedPidType != PID_TYPE_CLASSIC) {
+                return MSP_RESULT_ERROR;
+            }
+#endif
         }
 
         pidInitConfig(currentPidProfile);
