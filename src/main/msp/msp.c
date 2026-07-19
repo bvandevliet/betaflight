@@ -2730,8 +2730,13 @@ static mspResult_e mspFcProcessOutCommandWithArg(mspDescriptor_t srcDesc, int16_
             }
 
             // get/response: return "name = value"
-            // for set, this confirms the new value; for get, this returns the current value
-            char buf[len + 1];
+            // for set, this confirms the new value; for get, this returns the current value.
+            // Sized independently of the request length: "name = value" is always longer
+            // than a bare "name" GET query, so reusing the request buffer size here made
+            // cliGetSettingByName() fail unconditionally on every GET (no room left for
+            // " = value" after copying the name). MSP_PORT_OUTBUF_SIZE_MIN is 512 bytes,
+            // so 128 bytes of staging room is comfortably within what the frame can carry.
+            char buf[128];
             // extract just the name (before '=' if present)
             if (eq) {
                 // trim trailing spaces from name
@@ -2741,7 +2746,7 @@ static mspResult_e mspFcProcessOutCommandWithArg(mspDescriptor_t srcDesc, int16_
                 }
                 *nameEnd = '\0';
             }
-            const int written = cliGetSettingByName(cmdline, buf, len + 1);
+            const int written = cliGetSettingByName(cmdline, buf, sizeof(buf));
             if (written < 0 || written > (int)sbufBytesRemaining(dst)) {
                 if (!eq) {
                     return MSP_RESULT_ERROR;
